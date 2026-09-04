@@ -51,12 +51,250 @@ class RemediationOutcome:
     was left alone."""
 
 
+async def _pre_verdict_children(sc: Any, memory_id: str, tenant_id: str, md: dict) -> list[dict]:
+    """Rows derived from this one BEFORE any verdict existed. ``[]`` when none can.
+
+    H-10. The atomic-fact fan-out needs nothing here — it lives inside
+    ``_enrich_memory_background`` and runs remediation *before* it fans out, so
+    a drop stops it and a downgrade is carried onto the children it does create.
+    Auto-chunk is the path with no such ordering: on a deferred deployment the
+    write-time ``GovernanceDecision`` sees ``enrichment=None``, takes its
+    documented uncertain branch and enforces nothing, and the children are
+    committed immediately. The verdict arrives here minutes later, naming only
+    the parent.
+
+    Gated on ``auto_chunked`` rather than querying unconditionally. The lookup
+    filters on a JSON key with no supporting index, and a tenant configured
+    ``drop`` remediates constantly — so an ungated query would tax every
+    ordinary drop to serve the rare chunked one. The marker is safe to gate on
+    because it is stamped on the parent unconditionally, in the same function
+    that builds the children, and it is already present on the production rows
+    this fix has to reach — a NEW marker would only ever appear on rows written
+    after the deploy, leaving the existing leak in place.
+
+    Failures propagate. This module's contract is that a policy which could not
+    be applied must not be quietly treated as applied; swallowing a lookup error
+    would leave the children live, which is the leak this exists to close.
+    """
+    if not md.get("auto_chunked"):
+        return []
+    return await sc.find_children_by_parent_id(tenant_id, memory_id)
+
+
+def _child_id(child: dict) -> str | None:
+    raw = child.get("id")
+    return str(raw) if raw else None
+
+
+class GovernanceCascadeError(RuntimeError):
+    """Some derived rows could not be remediated after the parent already was.
+
+    Raised only once every child has been ATTEMPTED. The distinction matters:
+    aborting the loop on the first failure would leave the remaining children
+    live with the parent already gone — the leak this cascade exists to close,
+    reintroduced by the error handling rather than by the policy.
+
+    Still raised rather than logged, because the enclosing ``tracked_task`` is
+    what turns an unapplied policy into something a human sees; a swallowed
+    failure here is a policy silently treated as applied.
+
+    ``outcome`` carries what the PARENT's own remediation did, because that
+    part succeeded and a caller may need it. Without it this exception conflates
+    two very different states: "the parent's remediation failed, nothing
+    happened, retry from scratch" and "the parent was dropped or privatised and
+    only the derived cleanup fell short". A caller that wants to honour the
+    parent's verdict can read it; one that simply refuses to go on — which is
+    the safe default, and what every current caller does — can ignore it.
+    """
+
+    def __init__(self, message: str, outcome: RemediationOutcome | None = None) -> None:
+        super().__init__(message)
+        self.outcome = outcome or RemediationOutcome()
+
+
+def _raise_if_any_failed(
+    failed: list[str], *, parent_id: str, what: str, outcome: RemediationOutcome
+) -> None:
+    if not failed:
+        return
+    raise GovernanceCascadeError(
+        f"governance: {len(failed)} derived row(s) of {parent_id} could not be "
+        f"{what} ({', '.join(failed)}); the parent was already remediated, so these "
+        "rows still carry content the policy forbade",
+        outcome,
+    )
+
+
+async def _drop_children(
+    sc: Any,
+    children: list[dict],
+    *,
+    tenant_id: str,
+    parent_id: str,
+    action: str,
+    detail_for: Any,
+) -> None:
+    """Soft-delete each derived row, auditing before the delete as the parent does.
+
+    Per child rather than one rolled-up row: each is a separate soft-delete, and
+    an audit log that recorded one deletion while N happened would misstate the
+    compliance record in the direction that matters.
+
+    Contained PER CHILD, then raised once at the end. The parent is ALREADY
+    deleted by the time this runs, so letting the first failure abort the loop
+    would leave every later child live with the parent gone — this feature's own
+    leak, reintroduced by its error handling. One bad row must cost one row.
+
+    A retry is safe and narrow: the lookup excludes soft-deleted rows, so the
+    children that succeeded are not revisited and only the failures are
+    re-attempted. That holds only because the lookup reads the WRITER — see
+    ``find_children_by_parent_id``. Off the replica it would be false under
+    lag, and this paragraph would be a claim the code did not support: a retry
+    would re-fetch an already-deleted child and re-audit its removal.
+
+    The retry does re-run the parent's audit, which was already emitted — a
+    duplicate audit entry is the cost of not silently leaving forbidden content
+    live, and it is pre-existing behaviour for any remediation that raises, not
+    something this cascade introduces.
+    """
+    remediated = 0
+    failed: list[str] = []
+    for child in children:
+        cid = _child_id(child)
+        if not cid:
+            # Cannot delete it and cannot audit it against an id. Counted as a
+            # failure, not just logged: the row still holds content a policy
+            # forbade, and "we could not identify it" is not "it is handled".
+            # A retry will not fix this one — a person has to look.
+            logger.error(
+                "governance: derived row of %s has no usable id; it still holds "
+                "dropped content and was NOT removed",
+                parent_id,
+            )
+            failed.append("<no id>")
+            continue
+        try:
+            detail = detail_for(child.get("content") or "")
+            # Distinguishes a cascaded removal from a direct one, so a compliance
+            # review can see WHY a row with no governance signals of its own was
+            # dropped — the children are never enriched, so they carry none.
+            detail["cascaded_from"] = parent_id
+            await emit_governance_audit(
+                tenant_id=tenant_id,
+                agent_id=child.get("agent_id"),
+                action=action,
+                detail=detail,
+                resource_id=cid,
+                # Destructive, same as the parent: the audit is the only trace.
+                critical=True,
+            )
+            await sc.soft_delete_memory(cid, tenant_id)
+        except Exception:
+            logger.exception(
+                "governance: could not cascade %s to derived row %s of %s; it still holds dropped content",
+                action,
+                cid,
+                parent_id,
+            )
+            failed.append(cid)
+            continue
+        remediated += 1
+    if remediated:
+        # ``remediated``, not ``len(children)``: rows skipped above were not
+        # remediated, and a count that includes them overstates enforcement in
+        # the compliance log.
+        logger.info(
+            "governance: cascaded %s to %d derived row(s) of %s",
+            action,
+            remediated,
+            parent_id,
+        )
+    _raise_if_any_failed(
+        failed, parent_id=parent_id, what="dropped", outcome=RemediationOutcome(dropped=True)
+    )
+
+
+async def _privatise_children(
+    sc: Any,
+    children: list[dict],
+    *,
+    tenant_id: str,
+    parent_id: str,
+    detail_for: Any,
+) -> None:
+    """Downgrade each derived row's visibility alongside the parent's.
+
+    A child left at ``scope_team`` republishes exactly the content
+    ``keep_private`` just restricted (#808). Update-then-audit, mirroring the
+    parent's non-destructive branch — nothing is lost if the audit fails after
+    a visibility narrowing.
+
+    Contained per child and raised once at the end, for the same reason as
+    :func:`_drop_children`: the parent is already downgraded, so aborting on the
+    first failure would leave the rest publishing what the policy restricted.
+    A retry re-narrows rows already at ``scope_agent``, which is idempotent.
+    """
+    remediated = 0
+    failed: list[str] = []
+    for child in children:
+        cid = _child_id(child)
+        if not cid:
+            logger.error(
+                "governance: derived row of %s has no usable id; it still "
+                "publishes content the policy made private",
+                parent_id,
+            )
+            failed.append("<no id>")
+            continue
+        try:
+            await sc.update_memory(cid, tenant_id, {"visibility": "scope_agent"})
+            detail = detail_for(child.get("content") or "")
+            detail["cascaded_from"] = parent_id
+            await emit_governance_audit(
+                tenant_id=tenant_id,
+                agent_id=child.get("agent_id"),
+                action=ACTION_NB_KEEP_PRIVATE,
+                detail=detail,
+                resource_id=cid,
+            )
+        except Exception:
+            logger.exception(
+                "governance: could not cascade keep_private to derived row %s of %s; "
+                "it still publishes content the policy made private",
+                cid,
+                parent_id,
+            )
+            failed.append(cid)
+            continue
+        remediated += 1
+    if remediated:
+        logger.info(
+            "governance: cascaded keep_private to %d derived row(s) of %s",
+            remediated,
+            parent_id,
+        )
+    _raise_if_any_failed(
+        failed,
+        parent_id=parent_id,
+        what="made private",
+        outcome=RemediationOutcome(visibility="scope_agent"),
+    )
+
+
 async def remediate_after_enrichment(memory: dict, cfg: Any) -> RemediationOutcome:
     """Apply LLM-signal governance to a fast-mode row after enrichment landed.
 
     Returns what was done. A caller that only needs "should I stop?" reads
     ``.dropped``; one that creates derived rows must also honour
     ``.visibility``. No-op when governance is disabled or the signals are clean.
+
+    MAY RAISE ``GovernanceCascadeError`` after the parent's own remediation has
+    already succeeded — when rows derived from it could not be cleaned up. That
+    is deliberate rather than an oversight in the return contract: a caller
+    about to create MORE derived rows must not proceed when the existing ones
+    still hold content the policy forbade, and aborting is the fail-safe answer.
+    The exception carries the parent's ``outcome`` for any caller that needs to
+    tell "nothing happened" from "the parent was handled, the cleanup was not".
     """
     pii_cfg = cfg.governance_pii
     nb_cfg = cfg.governance_non_business
@@ -80,6 +318,10 @@ async def remediate_after_enrichment(memory: dict, cfg: Any) -> RemediationOutco
     if pii_cfg.enabled and md.get("contains_pii"):
         pii_types = md.get("pii_types") or []
         if pii_cfg.action == "drop":
+            # Resolved BEFORE the parent's audit and delete: a lookup failure
+            # then leaves everything intact and remediable, rather than a
+            # dropped parent whose children were never found (H-10).
+            children = await _pre_verdict_children(sc, memory_id, tenant_id, md)
             # Audit BEFORE the destructive delete (mirrors GovernanceScanContent's
             # audit-before-mutate): a delete that succeeds before a failing audit
             # would leave an untracked deletion in the tamper-evident log, whereas
@@ -96,6 +338,14 @@ async def remediate_after_enrichment(memory: dict, cfg: Any) -> RemediationOutco
             )
             await sc.soft_delete_memory(memory_id, tenant_id)
             logger.info("governance: dropped fast-mode memory %s (pii)", memory_id)
+            await _drop_children(
+                sc,
+                children,
+                tenant_id=tenant_id,
+                parent_id=memory_id,
+                action=ACTION_PII_DROP,
+                detail_for=lambda c: llm_pii_audit_detail(ACTION_PII_DROP, pii_types, c, "fast"),
+            )
             return RemediationOutcome(dropped=True)
         # mask/flag: the LLM gives no offsets to redact a free-form span, and in
         # fast mode the row is already persisted — so a "mask"-configured tenant
@@ -119,6 +369,8 @@ async def remediate_after_enrichment(memory: dict, cfg: Any) -> RemediationOutco
     # ── Business-vs-personal disposition ──
     if nb_cfg.enabled and md.get("business_relevance") == "personal":
         if nb_cfg.disposition == "drop":
+            # Before the parent's audit and delete — see the PII-drop branch.
+            children = await _pre_verdict_children(sc, memory_id, tenant_id, md)
             # Audit before the destructive delete (see the PII-drop branch above).
             await emit_governance_audit(
                 tenant_id=tenant_id,
@@ -131,15 +383,43 @@ async def remediate_after_enrichment(memory: dict, cfg: Any) -> RemediationOutco
             )
             await sc.soft_delete_memory(memory_id, tenant_id)
             logger.info("governance: dropped fast-mode memory %s (non-business)", memory_id)
+            await _drop_children(
+                sc,
+                children,
+                tenant_id=tenant_id,
+                parent_id=memory_id,
+                action=ACTION_NB_DROP,
+                detail_for=lambda c: nonbusiness_audit_detail(ACTION_NB_DROP, c, "fast"),
+            )
             return RemediationOutcome(dropped=True)
         if nb_cfg.disposition == "keep_private":
+            children = await _pre_verdict_children(sc, memory_id, tenant_id, md)
             await sc.update_memory(memory_id, tenant_id, {"visibility": "scope_agent"})
+            # The parent's OWN audit comes before the cascade, and the ordering
+            # is load-bearing rather than tidy. ``_privatise_children`` raises
+            # when a child fails, so with the cascade in between, one failed
+            # child left the parent durably narrowed with NO audit row at all —
+            # an untracked mutation, which this module's own docstrings forbid.
+            #
+            # The drop branches never had that exposure: they audit the parent
+            # before the destructive delete, so the cascade is already the last
+            # thing they do. This branch mutates first (nothing is lost if a
+            # non-destructive audit fails after), which put the natural place
+            # for the audit AFTER the mutation — and dropping the cascade in
+            # between quietly moved it behind a raise.
             await emit_governance_audit(
                 tenant_id=tenant_id,
                 agent_id=agent_id,
                 action=ACTION_NB_KEEP_PRIVATE,
                 detail=nonbusiness_audit_detail(ACTION_NB_KEEP_PRIVATE, content, "fast"),
                 resource_id=memory_id,
+            )
+            await _privatise_children(
+                sc,
+                children,
+                tenant_id=tenant_id,
+                parent_id=memory_id,
+                detail_for=lambda c: nonbusiness_audit_detail(ACTION_NB_KEEP_PRIVATE, c, "fast"),
             )
             # Reported so a caller creating derived rows can carry the
             # downgrade to them instead of publishing the same content wider.
