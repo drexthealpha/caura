@@ -10,6 +10,14 @@ Only the most recent releases are listed below. Every release, including those
 no longer shown here, is published with its full notes at
 [github.com/caura-ai/caura/releases](https://github.com/caura-ai/caura/releases).
 
+## [2.48.0](https://github.com/caura-ai/caura/compare/backend-v2.47.5...backend-v2.48.0) (2026-09-05)
+
+
+### Features
+
+* **mcp:** refuse an over-plan write, behind a flag ([#1296](https://github.com/caura-ai/caura/issues/1296)) ([4d81241](https://github.com/caura-ai/caura/commit/4d812419459bcf42e582dffe552be8da554f00fc))
+* **ops:** alert on embeddings written without provenance ([#1294](https://github.com/caura-ai/caura/issues/1294)) ([491dd15](https://github.com/caura-ai/caura/commit/491dd152b62de61544d1feac065e89d25afab431))
+
 ## [2.47.5](https://github.com/caura-ai/caura/compare/backend-v2.47.4...backend-v2.47.5) (2026-09-04)
 
 
