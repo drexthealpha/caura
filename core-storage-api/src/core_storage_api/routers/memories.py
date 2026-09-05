@@ -385,6 +385,24 @@ async def find_by_supersedes_id(tenant_id: str, supersedes_id: str) -> list[dict
     return [orm_to_dict(m, MEMORY_FIELDS) for m in memories]
 
 
+@router.post("/purge-entity-artifacts")
+async def purge_entity_artifacts(request: Request) -> dict:
+    """H-02 — drop the graph rows mined out of a governance-dropped memory.
+
+    POST, not DELETE: it removes rows across three tables and returns per-table
+    counts the caller audits. Body carries ``tenant_id`` and ``memory_id``.
+    """
+    body: dict = await request.json()
+    tenant_id = body.get("tenant_id")
+    memory_id = body.get("memory_id")
+    if not tenant_id or not memory_id:
+        # 4xx at the edge, same convention as the bulk route above: a missing
+        # scope here would be a delete with no tenant, which must never be a
+        # thing this endpoint attempts.
+        raise HTTPException(status_code=422, detail="tenant_id and memory_id are both required")
+    return await _svc.memory_purge_entity_artifacts(tenant_id=tenant_id, memory_id=UUID(str(memory_id)))
+
+
 @router.post("/find-successors")
 async def find_successors(request: Request) -> list[dict]:
     body: dict = await request.json()

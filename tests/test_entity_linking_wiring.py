@@ -74,6 +74,10 @@ async def test_extraction_triggers_cross_links_when_enabled(
     mock_extract.return_value = graph
 
     sc = MagicMock()
+    # H-02: the worker re-reads the memory before persisting, so nothing is
+    # written to the graph of a row governance dropped mid-extraction. These
+    # tests exercise a live row.
+    sc.get_memory = AsyncMock(return_value={"id": "m", "deleted_at": None})
     sc.find_entity_link = AsyncMock(return_value=None)
     sc.create_entity_link = AsyncMock()
     mock_sc_factory.return_value = sc
@@ -149,6 +153,10 @@ async def test_extraction_skips_cross_links_when_disabled(
     mock_extract.return_value = graph
 
     sc = MagicMock()
+    # H-02: the worker re-reads the memory before persisting, so nothing is
+    # written to the graph of a row governance dropped mid-extraction. These
+    # tests exercise a live row.
+    sc.get_memory = AsyncMock(return_value={"id": "m", "deleted_at": None})
     sc.find_entity_link = AsyncMock(return_value=None)
     sc.create_entity_link = AsyncMock()
     mock_sc_factory.return_value = sc
@@ -224,6 +232,10 @@ async def test_extraction_cross_link_failure_is_nonfatal(
     mock_extract.return_value = graph
 
     sc = MagicMock()
+    # H-02: the worker re-reads the memory before persisting, so nothing is
+    # written to the graph of a row governance dropped mid-extraction. These
+    # tests exercise a live row.
+    sc.get_memory = AsyncMock(return_value={"id": "m", "deleted_at": None})
     sc.find_entity_link = AsyncMock(return_value=None)
     sc.create_entity_link = AsyncMock()
     mock_sc_factory.return_value = sc
@@ -260,3 +272,117 @@ async def test_extraction_cross_link_failure_is_nonfatal(
         )
 
     mock_discover.assert_awaited_once()
+
+
+# ── H-02: a row governance dropped mid-extraction gets no graph rows ──
+
+
+def _one_entity_graph():
+    entity = MagicMock()
+    entity.canonical_name = "Alice"
+    entity.entity_type = "person"
+    entity.role = "subject"
+    graph = MagicMock()
+    graph.entities = [entity]
+    graph.relations = []
+    return graph
+
+
+def _graph_sc(*, deleted_at):
+    sc = MagicMock()
+    sc.get_memory = AsyncMock(return_value={"id": "m", "deleted_at": deleted_at})
+    sc.bulk_resolve_entities = AsyncMock(return_value=[None])
+    sc.bulk_upsert_entities = AsyncMock(return_value=[{"id": str(uuid.uuid4())}])
+    sc.bulk_upsert_entity_links = AsyncMock(
+        return_value=[{"input_idx": 0, "created": True}]
+    )
+    sc.find_entity_link = AsyncMock(return_value=None)
+    sc.create_entity_link = AsyncMock()
+    return sc
+
+
+@patch("core_api.services.entity_extraction_worker.log_action", new_callable=AsyncMock)
+@patch(
+    "core_api.services.entity_extraction_worker.get_embedding", new_callable=AsyncMock
+)
+@patch("core_api.services.entity_extraction_worker.get_storage_client")
+@patch(
+    "core_api.services.entity_extraction_worker.extract_entities_from_content",
+    new_callable=AsyncMock,
+)
+@patch("core_api.services.organization_settings.resolve_config", new_callable=AsyncMock)
+async def test_a_memory_dropped_during_extraction_gets_no_entities(
+    mock_resolve, mock_extract, mock_sc_factory, mock_embed, mock_log
+):
+    """H-02. Extraction is scheduled at write time, in parallel with the
+    enrichment that carries the governance verdict — so the row can already be
+    gone by the time the LLM call returns.
+
+    Writing entities for it would put the dropped content's names into a table
+    the drop does not reach, listable tenant-wide through ``/entities`` and
+    ``/graph``.
+
+    This closes the tail where extraction finishes AFTER the verdict. The
+    common ordering is the other way round — extraction is one LLM call, the
+    verdict needs enrichment plus an event round-trip — and the purge in
+    ``governance_remediation`` covers that. The two halves are not alternatives.
+    """
+    mock_resolve.return_value = _fake_config()
+    mock_extract.return_value = _one_entity_graph()
+    mock_embed.return_value = None
+    sc = _graph_sc(deleted_at="2026-09-05T00:00:00Z")
+    mock_sc_factory.return_value = sc
+
+    with patch("core_api.tasks.track_task"):
+        await process_entity_extraction(
+            memory_id=uuid.uuid4(),
+            tenant_id="test-tenant",
+            fleet_id=None,
+            agent_id="test-agent",
+            content="Alice loves coffee",
+            memory_type="episodic",
+        )
+
+    # Asserted on the WRITES, not on the early return, so a refactor that keeps
+    # the check but persists anyway still fails.
+    sc.bulk_upsert_entities.assert_not_awaited()
+    sc.bulk_upsert_entity_links.assert_not_awaited()
+
+
+@patch("core_api.services.entity_extraction_worker.log_action", new_callable=AsyncMock)
+@patch(
+    "core_api.services.entity_extraction_worker.get_embedding", new_callable=AsyncMock
+)
+@patch("core_api.services.entity_extraction_worker.get_storage_client")
+@patch(
+    "core_api.services.entity_extraction_worker.extract_entities_from_content",
+    new_callable=AsyncMock,
+)
+@patch("core_api.services.organization_settings.resolve_config", new_callable=AsyncMock)
+async def test_the_liveness_check_reads_the_writer(
+    mock_resolve, mock_extract, mock_sc_factory, mock_embed, mock_log
+):
+    """The check exists to observe a delete that just committed.
+
+    A replica under lag would report the row live, so the check would pass
+    exactly when it most needed to fail.
+    """
+    mock_resolve.return_value = _fake_config()
+    mock_extract.return_value = _one_entity_graph()
+    mock_embed.return_value = None
+    sc = _graph_sc(deleted_at=None)
+    mock_sc_factory.return_value = sc
+
+    with patch("core_api.tasks.track_task"):
+        await process_entity_extraction(
+            memory_id=uuid.uuid4(),
+            tenant_id="test-tenant",
+            fleet_id=None,
+            agent_id="test-agent",
+            content="Alice loves coffee",
+            memory_type="episodic",
+        )
+
+    assert sc.get_memory.await_args.kwargs.get("read") is False, (
+        sc.get_memory.await_args
+    )

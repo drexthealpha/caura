@@ -125,6 +125,33 @@ async def process_entity_extraction(
 
         sc = get_storage_client()
 
+        # H-02: is the memory still there? This is scheduled fire-and-forget at
+        # write time on both non-inline paths, in parallel with the enrichment
+        # that carries the governance verdict — so by the time the LLM call above
+        # returns, the policy may already have dropped the row. Writing entities
+        # for it would re-create the leak the drop exists to close, in a table
+        # the drop does not reach.
+        #
+        # ``read=False`` — the WRITER. The whole point is to observe a delete
+        # that just committed; a replica under lag would report the row live and
+        # this check would pass exactly when it most needed to fail.
+        #
+        # This narrows the window rather than closing it: extraction is one LLM
+        # call while the verdict needs enrichment plus an event round-trip, so
+        # extraction usually finishes FIRST and this check passes honestly. The
+        # cascade in ``governance_remediation`` is what covers that ordering —
+        # the two halves are not alternatives.
+        live = await sc.get_memory(str(memory_id), tenant_id, read=False)
+        if live is None or live.get("deleted_at") is not None:
+            logger.info(
+                "entity extraction: memory %s is gone by the time extraction finished; "
+                "discarding %d extracted entit(ies) rather than writing them to a "
+                "dropped row's graph",
+                memory_id,
+                len(graph.entities),
+            )
+            return
+
         blocklist = tenant_cfg.entity_blocklist
 
         # ---- Filter + dedupe entities up-front ----

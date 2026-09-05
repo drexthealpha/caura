@@ -6304,6 +6304,93 @@ class PostgresService:
             )
             return dict(result.all())  # type: ignore[arg-type]
 
+    async def memory_purge_entity_artifacts(self, tenant_id: str, memory_id: UUID) -> dict:
+        """Remove the graph rows mined out of one memory. Returns per-table counts.
+
+        H-02. The schema already says these rows must not outlive the memory:
+        ``memory_entity_links.memory_id`` is ``ON DELETE CASCADE`` and
+        ``relations.evidence_memory_id`` is ``ON DELETE SET NULL``. Both fire on
+        a HARD delete. Governance does a SOFT delete — it sets ``deleted_at`` —
+        so neither ever fires, and the entity names mined from dropped content
+        (person names, under a PII policy) stay listable tenant-wide through
+        ``/entities`` and ``/graph``.
+
+        The entity row itself has no FK to the memory at all, so nothing would
+        remove it even on a hard delete. That is why this is three statements
+        and not one.
+
+        Order matters and is not arbitrary:
+
+        0. note which entities THIS memory linked to, before the links go,
+        1. delete those links,
+        2. delete relations whose evidence IS this memory — one row carries one
+           evidence id, so a relation attributed to dropped content has no
+           other justification,
+        3. delete, FROM THE NOTED SET ONLY, entities now left with no links and
+           no relations.
+
+        Step 0 is what keeps step 3 honest. Deleting every entity in the tenant
+        that happens to have no links would be a far larger blast radius than
+        this function's job: it would sweep entities orphaned for unrelated
+        reasons, and race an entity that a concurrent write has created but not
+        yet linked. The candidate set is bounded to what this memory touched,
+        so an unrelated orphan is left alone. Under-deleting is recoverable;
+        over-deleting another caller's rows is not.
+
+        An entity still referenced by another live memory is likewise kept — the
+        name is not this memory's to remove once something else asserts it.
+
+        One transaction: a partial purge would leave the graph half-cleaned with
+        nothing recording which half.
+        """
+        async with get_session() as session:
+            candidates = (
+                (
+                    await session.execute(
+                        select(MemoryEntityLink.entity_id).where(MemoryEntityLink.memory_id == memory_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            link_rows = await session.execute(
+                delete(MemoryEntityLink).where(MemoryEntityLink.memory_id == memory_id)
+            )
+            relation_rows = await session.execute(
+                delete(Relation).where(
+                    Relation.tenant_id == tenant_id,
+                    Relation.evidence_memory_id == memory_id,
+                )
+            )
+
+            entity_count = 0
+            if candidates:
+                still_linked = select(MemoryEntityLink.entity_id)
+                rel_from = select(Relation.from_entity_id)
+                rel_to = select(Relation.to_entity_id)
+                entity_rows = await session.execute(
+                    delete(Entity).where(
+                        # Tenant-scoped like everything else here. Not about id
+                        # collisions — about never letting one tenant's
+                        # remediation reach another tenant's rows.
+                        Entity.tenant_id == tenant_id,
+                        Entity.id.in_(candidates),
+                        Entity.id.not_in(still_linked),
+                        Entity.id.not_in(rel_from),
+                        Entity.id.not_in(rel_to),
+                    )
+                )
+                entity_count = entity_rows.rowcount or 0  # type: ignore[attr-defined]
+
+            # ``rowcount`` is untyped on ``Result`` — same ignore as
+            # ``memory_soft_delete_by_ids`` above, for the same reason.
+            return {
+                "links": link_rows.rowcount or 0,  # type: ignore[attr-defined]
+                "relations": relation_rows.rowcount or 0,  # type: ignore[attr-defined]
+                "entities": entity_count,
+            }
+
     async def entity_get_linked_memories(
         self,
         entity_id: UUID,
